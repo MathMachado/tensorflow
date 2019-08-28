@@ -42,6 +42,7 @@ limitations under the License.
 #include "tensorflow/core/public/version.h"
 #include "tensorflow/core/util/tensor_slice_reader_cache.h"
 #if !defined(IS_MOBILE_PLATFORM)
+#include "tensorflow/compiler/jit/xla_kernel_creator_util.h"
 #include "tensorflow/core/grappler/optimizers/meta_optimizer.h"
 #endif  // !IS_MOBILE_PLATFORM
 
@@ -78,7 +79,18 @@ Status KernelAndDeviceOp::Init(const NodeDef& ndef,
         "A valid FunctionLibraryRuntime must be provided when running ops "
         "based on OpKernel.");
   }
-  TF_RETURN_IF_ERROR(flr_->CreateKernel(ndef, &k));
+  if (compile_with_xla_) {
+#if defined(IS_MOBILE_PLATFORM)
+    return errors::Unimplemented(
+        "Compile with XLA is not available on mobile devices.");
+#else   // !IS_MOBILE_PLATFORM
+    std::unique_ptr<OpKernel> kernel;
+    TF_RETURN_IF_ERROR(CreateXlaKernel(flr_, ndef, &kernel));
+    k = kernel.release();
+#endif  // !IS_MOBILE_PLATFORM
+  } else {
+    TF_RETURN_IF_ERROR(flr_->CreateKernel(ndef, &k));
+  }
   kernel_.reset(k);
   return Status::OK();
 }
@@ -207,7 +219,7 @@ void UpdateStats(OpKernelContext* context,
 
     absl::optional<AllocatorStats> allocator_stats =
         allocator_pair.first->GetStats();
-    if (stats) {
+    if (allocator_stats) {
       memory->set_allocator_bytes_in_use(allocator_stats->bytes_in_use);
     }
     allocator_pair.second->GetRecordsAndUnRef();
@@ -259,6 +271,7 @@ Status KernelAndDeviceOp::Run(ScopedStepContainer* step_container,
   }
 
   OpKernelContext::Params params;
+  params.is_eager = true;
   params.device = device_;
   params.frame_iter = FrameAndIter(0, 0);
   params.inputs = &inputs;
@@ -313,32 +326,18 @@ Status KernelAndDeviceOp::Run(ScopedStepContainer* step_container,
     done.WaitForNotification();
   } else {
     const string& op_name = kernel_->name();
-    // If tracing if off, the overheads of ScopedAnnotation and TraceMe
-    // are negligible.
-    if (device_->TraceUsingAnnotations()) {
-      // 'ScopedActivity' will trace the OpKernel scheduling time on host.
-      profiler::TraceMe activity(
-          [&] {
-            return strings::StrCat(
-                op_name, ":", kernel_->type_string(),
-                "#id=", step_container ? step_container->step_id() : 0,
-                ",device=", device_->name(), ",async=false#");
-          },
-          profiler::TraceMeLevel::kInfo);
-      // 'ScopedAnnotation' will trace the OpKernel execution time on device.
-      tracing::ScopedAnnotation annotation(op_name, kernel_->type_string());
-      device_->Compute(kernel_.get(), &context);
-    } else {
-      profiler::TraceMe activity(
-          [&] {
-            return strings::StrCat(
-                op_name, ":", kernel_->type_string(),
-                "#id=", step_container ? step_container->step_id() : 0,
-                ",device=", device_->name(), ",async=false#");
-          },
-          profiler::TraceMeLevel::kInfo);
-      device_->Compute(kernel_.get(), &context);
-    }
+    // 'ScopedActivity' will trace the OpKernel scheduling time on host.
+    profiler::TraceMe activity(
+        [&] {
+          return absl::StrCat(op_name, ":", kernel_->type_string(), "#id=",
+                              step_container ? step_container->step_id() : 0,
+                              ",device=", device_->name(), ",async=false#");
+        },
+        profiler::TraceMeLevel::kInfo);
+    // 'ScopedAnnotation' will trace the OpKernel execution time on device.
+    tracing::ScopedAnnotation annotation(
+        [&]() { return absl::StrCat(op_name, ":", kernel_->type_string()); });
+    device_->Compute(kernel_.get(), &context);
   }
 
   // Clean up execution op_execution_state if deferred ops aren't running.
